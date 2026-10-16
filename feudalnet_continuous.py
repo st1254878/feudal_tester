@@ -169,6 +169,33 @@ class ContinuousFeUdalNetwork(nn.Module):
         )
         self.manager_hidden = self.manager.mrnn.init_hidden(num_workers, device)
 
+        # Online observation normalization buffers (saved automatically in state_dict)
+        self.register_buffer("obs_mean", torch.zeros(1, obs_dim, device=device))
+        self.register_buffer("obs_var", torch.ones(1, obs_dim, device=device))
+        self.register_buffer("obs_count", torch.tensor(1e-4, dtype=torch.float32, device=device))
+
+    def _normalize_obs(self, x: torch.Tensor, update: bool = True) -> torch.Tensor:
+        if update and self.training:
+            batch_mean = x.mean(dim=0, keepdim=True)
+            batch_var = x.var(dim=0, unbiased=False, keepdim=True)
+            batch_count = float(x.shape[0])
+
+            delta = batch_mean - self.obs_mean
+            tot_count = self.obs_count + batch_count
+
+            new_mean = self.obs_mean + delta * batch_count / tot_count
+            m_a = self.obs_var * self.obs_count
+            m_b = batch_var * batch_count
+            m2 = m_a + m_b + delta.pow(2) * self.obs_count * batch_count / tot_count
+            new_var = m2 / tot_count
+
+            self.obs_mean.copy_(new_mean)
+            self.obs_var.copy_(new_var)
+            self.obs_count.copy_(tot_count)
+
+        x_norm = (x - self.obs_mean) / torch.sqrt(self.obs_var + 1e-8)
+        return torch.clamp(x_norm, -10.0, 10.0)
+
     def init_obj(self):
         window_size = 2 * self.c + 1
         goals = [torch.zeros(self.num_workers, self.d, device=self.device, requires_grad=True) for _ in range(window_size)]
@@ -182,10 +209,11 @@ class ContinuousFeUdalNetwork(nn.Module):
 
     def forward(self, x: torch.Tensor, goals: list[torch.Tensor], states: list[torch.Tensor], mask: torch.Tensor, save: bool = True):
         if not isinstance(x, torch.Tensor):
-            x = torch.tensor(x, dtype=torch.float32, device=self.device)
+            x = torch.as_tensor(x, dtype=torch.float32, device=self.device)
         else:
-            x = x.to(self.device)
+            x = x.to(self.device, dtype=torch.float32)
 
+        x = self._normalize_obs(x, update=save)
         z = self.percept(x)
         goal, self.manager_hidden, state, value_m = self.manager(z, self.manager_hidden, mask)
 
@@ -212,24 +240,27 @@ def continuous_feudal_loss(storage: Storage, next_v_m: torch.Tensor, next_v_w: t
     storage.placeholder(['ret_m', 'ret_w'])
     for i in reversed(range(args.num_steps)):
         ret_m = storage.r[i] + args.gamma_m * ret_m * storage.m[i]
-        ret_w = storage.r[i] + args.gamma_w * ret_w * storage.m[i]
+        ret_w = (storage.r[i] + args.alpha * storage.r_i[i]) + args.gamma_w * ret_w * storage.m[i]
         storage.ret_m[i] = ret_m
         storage.ret_w[i] = ret_w
-
-    storage.normalize(['ret_w', 'ret_m'])
 
     rewards_intrinsic, value_m, value_w, ret_w, ret_m, logps, entropy, state_goal_cosines = storage.stack(
         ['r_i', 'v_m', 'v_w', 'ret_w', 'ret_m', 'logp', 'entropy', 's_goal_cos']
     )
 
-    advantage_w = ret_w + args.alpha * rewards_intrinsic - value_w
+    # Critic learns true unnormalized returns (preserves value scale across rollout boundaries)
+    advantage_w = ret_w - value_w
     advantage_m = ret_m - value_m
-
-    loss_worker = (logps * advantage_w.detach()).mean()
-    loss_manager = (state_goal_cosines * advantage_m.detach()).mean()
 
     value_w_loss = 0.5 * advantage_w.pow(2).mean()
     value_m_loss = 0.5 * advantage_m.pow(2).mean()
+
+    # Standardize advantages before policy gradient updates to prevent velocity-induced gradient spikes
+    adv_w_norm = (advantage_w.detach() - advantage_w.detach().mean()) / (advantage_w.detach().std() + 1e-8)
+    adv_m_norm = (advantage_m.detach() - advantage_m.detach().mean()) / (advantage_m.detach().std() + 1e-8)
+
+    loss_worker = (logps * adv_w_norm).mean()
+    loss_manager = (state_goal_cosines * adv_m_norm).mean()
 
     mean_entropy = entropy.mean()
 

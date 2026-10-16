@@ -32,7 +32,11 @@ def parse_args():
 
     # Optimization
     parser.add_argument("--lr", type=float, default=0.0003,
-                        help="Learning rate for RMSprop or Adam optimizer")
+                        help="Base learning rate for Worker & Percept modules")
+    parser.add_argument("--lr-manager", type=float, default=0.0001,
+                        help="Learning rate for Manager module (two-timescale stability, default: 1e-4)")
+    parser.add_argument("--lr-decay", action=argparse.BooleanOptionalAction, default=True,
+                        help="Linearly decay learning rates over max-steps (default: True, use --no-lr-decay to disable)")
     parser.add_argument("--grad-clip", type=float, default=5.0,
                         help="Gradient clipping maximum norm")
     parser.add_argument("--entropy-coef", type=float, default=0.001,
@@ -225,15 +229,28 @@ def train(args):
         device=device
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
+    # Two-timescale Adam optimizer:
+    # Worker & Percept use args.lr (default 3e-4); Manager uses args.lr_manager (default 1e-4)
+    # to prevent Manager latent goal drift ("Moving Target" instability).
+    worker_params = list(model.percept.parameters()) + list(model.worker.parameters())
+    manager_params = list(model.manager.parameters())
+    optimizer = torch.optim.Adam([
+        {"params": worker_params, "lr": args.lr, "initial_lr": args.lr, "name": "worker"},
+        {"params": manager_params, "lr": args.lr_manager, "initial_lr": args.lr_manager, "name": "manager"},
+    ], eps=1e-5)
 
     step = 0
+    best_eval_reward = -float("inf")
     if args.resume and os.path.isfile(args.resume):
         print(f"Loading checkpoint from: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        model.load_state_dict(checkpoint["model"], strict=False)
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        except ValueError:
+            print("[Warning] Optimizer param groups changed; re-initializing optimizer state.")
         step = checkpoint.get("step", 0)
+        best_eval_reward = checkpoint.get("best_eval_reward", -float("inf"))
         print(f"Resumed from step {step}")
 
     goals, states, masks = model.init_obj()
@@ -245,6 +262,13 @@ def train(args):
 
     try:
         while step < args.max_steps:
+            # Linear Learning Rate Decay down to 10% of initial LR
+            if args.lr_decay:
+                progress = min(1.0, step / max(1, args.max_steps))
+                lr_mult = max(0.1, 1.0 - 0.9 * progress)
+                optimizer.param_groups[0]["lr"] = args.lr * lr_mult
+                optimizer.param_groups[1]["lr"] = args.lr_manager * lr_mult
+
             model.repackage_hidden()
             goals = [g.detach() for g in goals]
             storage.reset()
@@ -289,6 +313,8 @@ def train(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
+            loss_dict["train/lr_worker"] = optimizer.param_groups[0]["lr"]
+            loss_dict["train/lr_manager"] = optimizer.param_groups[1]["lr"]
             logger.log_scalars(loss_dict, step)
 
             # Periodic Deterministic Evaluation
@@ -302,7 +328,20 @@ def train(args):
                     "eval/std_reward": eval_std,
                     "eval/mean_length": eval_len
                 }, step)
-                print(f"\n>>> [EVAL @ Step {step:,}] Deterministic Return: {eval_mean:.2f} +/- {eval_std:.2f} | Length: {eval_len:.1f}\n")
+                print(f"\n>>> [EVAL @ Step {step:,}] Deterministic Return: {eval_mean:.2f} +/- {eval_std:.2f} | Length: {eval_len:.1f}")
+                if eval_mean > best_eval_reward:
+                    best_eval_reward = eval_mean
+                    best_path = os.path.join(logger.checkpoint_dir, "model_best.pt")
+                    torch.save({
+                        "step": step,
+                        "best_eval_reward": best_eval_reward,
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "args": vars(args)
+                    }, best_path)
+                    print(f">>> [NEW BEST] Saved peak model ({best_eval_reward:.2f}) -> {best_path}\n")
+                else:
+                    print()
                 next_eval_step = step + args.eval_interval
 
             if step >= next_save_step:

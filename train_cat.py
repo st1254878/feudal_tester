@@ -35,7 +35,9 @@ def parse_args():
 
     # Optimization
     parser.add_argument("--lr", type=float, default=0.0003,
-                        help="Learning rate for RMSprop optimizer")
+                        help="Learning rate for RMSprop optimizer (Worker & Percept)")
+    parser.add_argument("--lr-manager", type=float, default=0.0001,
+                        help="Learning rate for Manager module (two-timescale stability, default: 1e-4)")
     parser.add_argument("--grad-clip", type=float, default=5.0,
                         help="Gradient clipping maximum norm")
     parser.add_argument("--entropy-coef", type=float, default=0.01,
@@ -121,14 +123,22 @@ def train(args):
         device=device
     ).to(device)
 
-    optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr, alpha=0.99, eps=1e-5)
+    worker_params = list(model.percept.parameters()) + list(model.worker.parameters())
+    manager_params = list(model.manager.parameters())
+    optimizer = torch.optim.RMSprop([
+        {"params": worker_params, "lr": args.lr},
+        {"params": manager_params, "lr": args.lr_manager},
+    ], alpha=0.99, eps=1e-5)
 
     step = 0
     if args.resume and os.path.isfile(args.resume):
         print(f"Loading checkpoint from: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        except ValueError:
+            print("[Warning] Optimizer param groups changed; re-initializing optimizer state.")
         model.preprocessor.rms.mean = checkpoint.get("rms_mean", model.preprocessor.rms.mean)
         model.preprocessor.rms.var = checkpoint.get("rms_var", model.preprocessor.rms.var)
         model.preprocessor.rms.count = checkpoint.get("rms_count", model.preprocessor.rms.count)

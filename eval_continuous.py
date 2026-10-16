@@ -7,12 +7,15 @@ import torch
 import gymnasium as gym
 
 from feudalnet_continuous import ContinuousFeUdalNetwork
+from feudal_cat_continuous import ContinuousFeUdalCatNetwork
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Continuous FeUdal Network on MuJoCo")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to trained model checkpoint .pt file")
+    parser.add_argument("--model-type", type=str, default="fun", choices=["fun", "feudal_cat"],
+                        help="Model architecture: standard FuN ('fun') or direct goal concatenation ('feudal_cat')")
     parser.add_argument("--env-name", type=str, default="HalfCheetah-v4",
                         help="Gymnasium MuJoCo environment ID (HalfCheetah-v4, Ant-v4, etc.)")
     parser.add_argument("--episodes", type=int, default=1,
@@ -46,7 +49,8 @@ def evaluate(args):
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
 
-    model = ContinuousFeUdalNetwork(
+    model_cls = ContinuousFeUdalCatNetwork if args.model_type == "feudal_cat" else ContinuousFeUdalNetwork
+    model = model_cls(
         num_workers=1,
         obs_dim=obs_dim,
         act_dim=act_dim,
@@ -62,7 +66,7 @@ def evaluate(args):
     if args.checkpoint and os.path.isfile(args.checkpoint):
         print(f"Loading checkpoint: {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["model"])
+        model.load_state_dict(checkpoint["model"], strict=False)
         print("Checkpoint successfully loaded!")
     else:
         print("No checkpoint specified; evaluating randomly initialized agent.")
