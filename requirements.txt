@@ -1,0 +1,19 @@
+# Deep Learning & Tensor Operations
+torch>=2.2.0
+torchvision
+
+# Reinforcement Learning Environments
+gymnasium[atari]>=1.0.0
+ale-py>=0.9.0
+AutoROM[accept-rom-license]
+mujoco>=3.0.0
+
+# Scientific Computing & Data Processing
+numpy>=1.24.0
+scipy>=1.10.0
+pillow>=10.0.0
+psutil
+
+# Visualization & Logging
+tensorboard>=2.15.0
+matplotlib>=3.7.0

@@ -1,0 +1,47 @@
+# ==============================================================================
+# FeUdal Networks (.gitignore)
+# ==============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Model Weights and Checkpoints (Large binary files)
+checkpoints/
+checkpoints_continuous/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# TensorBoard Logs and Run Directories
+runs/
+runs_continuous/
+*.tfevents.*
+
+# Scratch Scripts & Intermediate Output
+scratch/
+plots/
+*.log
+MUJOCO_LOG.TXT
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE & Editor Configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
