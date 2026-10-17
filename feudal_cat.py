@@ -68,12 +68,12 @@ class Manager(nn.Module):
         self.mrnn = DilatedLSTM(self.d, self.d, radius=self.r)
         self.critic = nn.Linear(self.d, 1)
 
-    def forward(self, z: torch.Tensor, hidden: tuple[torch.Tensor, torch.Tensor], mask: torch.Tensor):
+    def forward(self, z: torch.Tensor, hidden: tuple[torch.Tensor, torch.Tensor], mask: torch.Tensor, save: bool = True):
         state = F.relu(self.mspace(z))
         mask_expanded = mask.unsqueeze(1)  # [B, 1, 1]
         hidden = (mask_expanded * hidden[0], mask_expanded * hidden[1])
 
-        goal_hat, hidden = self.mrnn(state, hidden)
+        goal_hat, hidden = self.mrnn(state, hidden, save=save)
         value_est = self.critic(goal_hat)
 
         goal = normalize(goal_hat)
@@ -88,7 +88,9 @@ class Manager(nn.Module):
         """
         Calculates cosine similarity for Manager Transition Policy Gradient:
             cos(s_{t+c} - s_t, g_t(theta_M))
-        states, goals, masks are lists of length 2*c + 1 centered at t = c.
+        states, goals, masks are lists of length 2*c + 1.
+        At rollout step tau = t + c:
+            states[2*c] is s_{t+c}, states[c] is s_t, goals[c] is g_t.
         """
         t = self.c
         mask = torch.stack(masks[t : t + self.c]).prod(dim=0)
@@ -151,17 +153,18 @@ class WorkerCat(nn.Module):
         """
         Intrinsic reward for the Worker (Eq. 8 in paper):
             r^I_t = 1/c sum_{i=1}^c cos(s_t - s_{t-i}, g_{t-i})
+        Evaluated at the latest state in the sliding window (t = 2 * c).
         """
-        t = self.c
+        t = 2 * self.c
         b = states[0].shape[0]
         r_i = torch.zeros(b, 1, device=self.device)
         mask_cum = torch.ones(b, 1, device=self.device)
 
         for i in range(1, self.c + 1):
+            mask_cum = mask_cum * masks[t - i]
             s_diff = states[t] - states[t - i]
             cos_sim = cosine_similarity(s_diff, goals[t - i]).unsqueeze(-1)
             r_i += mask_cum * cos_sim
-            mask_cum = mask_cum * masks[t - i]
 
         return (r_i / self.c).detach()
 
@@ -227,16 +230,22 @@ class FeUdalCatNetwork(nn.Module):
         z = self.percept(x_tensor)
 
         # Manager forward
-        goal, self.manager_hidden, state, value_m = self.manager(z, self.manager_hidden, mask)
+        goal, manager_hidden, state, value_m = self.manager(z, self.manager_hidden, mask, save=save)
 
         if save:
+            self.manager_hidden = manager_hidden
             goals.pop(0)
             goals.append(goal)
             states.pop(0)
             states.append(state)
+            worker_goals = goals
+        else:
+            worker_goals = goals[1:] + [goal]
 
         # Worker forward with direct goal concatenation
-        action_probs, self.worker_hidden, value_w = self.worker(z, goals, self.worker_hidden, mask)
+        action_probs, worker_hidden, value_w = self.worker(z, worker_goals, self.worker_hidden, mask)
+        if save:
+            self.worker_hidden = worker_hidden
 
         return action_probs, goals, states, value_m, value_w
 
@@ -258,7 +267,8 @@ def feudal_cat_loss(storage: Storage, next_v_m: torch.Tensor, next_v_w: torch.Te
     storage.placeholder(['ret_m', 'ret_w'])
     for i in reversed(range(args.num_steps)):
         ret_m = storage.r[i] + args.gamma_m * ret_m * storage.m[i]
-        ret_w = (storage.r[i] + args.alpha * storage.r_i[i]) + args.gamma_w * ret_w * storage.m[i]
+        r_i_step = storage.r_i[i + 1] if i + 1 < args.num_steps else storage.r_i[i]
+        ret_w = (storage.r[i] + args.alpha * r_i_step) + args.gamma_w * ret_w * storage.m[i]
         storage.ret_m[i] = ret_m
         storage.ret_w[i] = ret_w
 
@@ -270,7 +280,16 @@ def feudal_cat_loss(storage: Storage, next_v_m: torch.Tensor, next_v_w: torch.Te
     advantage_m = ret_m - value_m
 
     loss_worker = (logps * advantage_w.detach()).mean()
-    loss_manager = (state_goal_cosines * advantage_m.detach()).mean()
+
+    c = args.time_horizon
+    if args.num_steps > c:
+        aligned_cosines = state_goal_cosines[c:]
+        aligned_adv_m = advantage_m[:-c].detach()
+    else:
+        aligned_cosines = state_goal_cosines
+        aligned_adv_m = advantage_m.detach()
+
+    loss_manager = (aligned_cosines * aligned_adv_m).mean()
 
     value_w_loss = 0.5 * advantage_w.pow(2).mean()
     value_m_loss = 0.5 * advantage_m.pow(2).mean()
@@ -288,7 +307,7 @@ def feudal_cat_loss(storage: Storage, next_v_m: torch.Tensor, next_v_w: torch.Te
         'policy/entropy': mean_entropy.item(),
         'policy/worker_advantage': advantage_w.mean().item(),
         'policy/worker_intrinsic_reward': rewards_intrinsic.mean().item(),
-        'policy/manager_cosines': state_goal_cosines.mean().item(),
+        'policy/manager_cosines': aligned_cosines.mean().item(),
         'policy/manager_advantage': advantage_m.mean().item(),
     }
 

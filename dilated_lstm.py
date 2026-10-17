@@ -20,11 +20,12 @@ class DilatedLSTM(nn.Module):
         self.rnn = nn.LSTMCell(input_size, hidden_size)
         self.dilation = 0
 
-    def forward(self, state: torch.Tensor, hidden: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, state: torch.Tensor, hidden: tuple[torch.Tensor, torch.Tensor], save: bool = True) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
             state: [batch_size, input_size]
             hidden: tuple of (hx, cx), each of shape [batch_size, radius, hidden_size]
+            save: whether to advance internal dilation counter (False during bootstrap evaluation)
         Returns:
             y: pooled output [batch_size, hidden_size]
             (hx_next, cx_next): updated hidden states [batch_size, radius, hidden_size]
@@ -51,7 +52,8 @@ class DilatedLSTM(nn.Module):
         other_cores_sum = sum(hx[:, i].detach() for i in range(self.radius) if i != idx)
         y = (h_next + other_cores_sum) / self.radius
 
-        self.dilation = (self.dilation + 1) % self.radius
+        if save:
+            self.dilation = (self.dilation + 1) % self.radius
         return y, (hx_new, cx_new)
 
     def init_hidden(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:

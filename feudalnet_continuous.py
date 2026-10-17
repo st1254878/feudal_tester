@@ -53,12 +53,12 @@ class ContinuousManager(nn.Module):
         self.mrnn = DilatedLSTM(self.d, self.d, radius=self.r)
         self.critic = nn.Linear(self.d, 1)
 
-    def forward(self, z: torch.Tensor, hidden: tuple[torch.Tensor, torch.Tensor], mask: torch.Tensor):
+    def forward(self, z: torch.Tensor, hidden: tuple[torch.Tensor, torch.Tensor], mask: torch.Tensor, save: bool = True):
         state = F.elu(self.mspace(z))
         mask_expanded = mask.unsqueeze(1)
         hidden = (mask_expanded * hidden[0], mask_expanded * hidden[1])
 
-        goal_hat, hidden = self.mrnn(state, hidden)
+        goal_hat, hidden = self.mrnn(state, hidden, save=save)
         value_est = self.critic(goal_hat)
         goal = normalize(goal_hat)
 
@@ -120,16 +120,16 @@ class ContinuousWorker(nn.Module):
         return dist, hidden, value_est
 
     def intrinsic_reward(self, states: list[torch.Tensor], goals: list[torch.Tensor], masks: list[torch.Tensor]) -> torch.Tensor:
-        t = self.c
+        t = 2 * self.c
         b = states[0].shape[0]
         r_i = torch.zeros(b, 1, device=self.device)
         mask_cum = torch.ones(b, 1, device=self.device)
 
         for i in range(1, self.c + 1):
+            mask_cum = mask_cum * masks[t - i]
             s_diff = states[t] - states[t - i]
             cos_sim = cosine_similarity(s_diff, goals[t - i]).unsqueeze(-1)
             r_i += mask_cum * cos_sim
-            mask_cum = mask_cum * masks[t - i]
 
         return (r_i / self.c).detach()
 
@@ -215,15 +215,22 @@ class ContinuousFeUdalNetwork(nn.Module):
 
         x = self._normalize_obs(x, update=save)
         z = self.percept(x)
-        goal, self.manager_hidden, state, value_m = self.manager(z, self.manager_hidden, mask)
+        goal, manager_hidden, state, value_m = self.manager(z, self.manager_hidden, mask, save=save)
 
         if save:
+            self.manager_hidden = manager_hidden
             goals.pop(0)
             goals.append(goal)
             states.pop(0)
             states.append(state)
+            worker_goals = goals
+        else:
+            worker_goals = goals[1:] + [goal]
 
-        action_dist, self.worker_hidden, value_w = self.worker(z, goals, self.worker_hidden, mask)
+        action_dist, worker_hidden, value_w = self.worker(z, worker_goals, self.worker_hidden, mask)
+        if save:
+            self.worker_hidden = worker_hidden
+
         return action_dist, goals, states, value_m, value_w
 
     def intrinsic_reward(self, states, goals, masks):
@@ -240,7 +247,8 @@ def continuous_feudal_loss(storage: Storage, next_v_m: torch.Tensor, next_v_w: t
     storage.placeholder(['ret_m', 'ret_w'])
     for i in reversed(range(args.num_steps)):
         ret_m = storage.r[i] + args.gamma_m * ret_m * storage.m[i]
-        ret_w = (storage.r[i] + args.alpha * storage.r_i[i]) + args.gamma_w * ret_w * storage.m[i]
+        r_i_step = storage.r_i[i + 1] if i + 1 < args.num_steps else storage.r_i[i]
+        ret_w = (storage.r[i] + args.alpha * r_i_step) + args.gamma_w * ret_w * storage.m[i]
         storage.ret_m[i] = ret_m
         storage.ret_w[i] = ret_w
 
@@ -260,7 +268,16 @@ def continuous_feudal_loss(storage: Storage, next_v_m: torch.Tensor, next_v_w: t
     adv_m_norm = (advantage_m.detach() - advantage_m.detach().mean()) / (advantage_m.detach().std() + 1e-8)
 
     loss_worker = (logps * adv_w_norm).mean()
-    loss_manager = (state_goal_cosines * adv_m_norm).mean()
+
+    c = args.time_horizon
+    if args.num_steps > c:
+        aligned_cosines = state_goal_cosines[c:]
+        aligned_adv_m = adv_m_norm[:-c]
+    else:
+        aligned_cosines = state_goal_cosines
+        aligned_adv_m = adv_m_norm
+
+    loss_manager = (aligned_cosines * aligned_adv_m).mean()
 
     mean_entropy = entropy.mean()
 
@@ -275,7 +292,7 @@ def continuous_feudal_loss(storage: Storage, next_v_m: torch.Tensor, next_v_w: t
         'policy/entropy': mean_entropy.item(),
         'policy/worker_advantage': advantage_w.mean().item(),
         'policy/worker_intrinsic_reward': rewards_intrinsic.mean().item(),
-        'policy/manager_cosines': state_goal_cosines.mean().item(),
+        'policy/manager_cosines': aligned_cosines.mean().item(),
         'policy/manager_advantage': advantage_m.mean().item(),
     }
 
