@@ -36,6 +36,46 @@ class ContinuousPercept(nn.Module):
         return self.net(x)
 
 
+class ValueNormalizer(nn.Module):
+    """
+    Running mean and variance normalizer for Value / Return targets (PopArt-lite).
+    Preserves exact Bellman consistency in true reward scale across rollouts,
+    while scaling Critic regression targets to O(1) so Critic gradients never crush the Actor.
+    """
+    def __init__(self, device: torch.device):
+        super().__init__()
+        self.register_buffer("mean", torch.tensor(0.0, dtype=torch.float32, device=device))
+        self.register_buffer("var", torch.tensor(1.0, dtype=torch.float32, device=device))
+        self.register_buffer("count", torch.tensor(1e-4, dtype=torch.float32, device=device))
+
+    def update(self, x: torch.Tensor):
+        with torch.no_grad():
+            batch_mean = x.mean()
+            batch_var = x.var(unbiased=False)
+            batch_count = float(x.numel())
+
+            delta = batch_mean - self.mean
+            tot_count = self.count + batch_count
+
+            new_mean = self.mean + delta * batch_count / tot_count
+            m_a = self.var * self.count
+            m_b = batch_var * batch_count
+            m2 = m_a + m_b + delta.pow(2) * self.count * batch_count / tot_count
+            new_var = m2 / tot_count
+
+            self.mean.copy_(new_mean)
+            self.var.copy_(new_var)
+            self.count.copy_(tot_count)
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        std = torch.sqrt(torch.clamp(self.var, min=1.0))
+        return (x - self.mean) / std
+
+    def denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        std = torch.sqrt(torch.clamp(self.var, min=1.0))
+        return x * std + self.mean
+
+
 class ContinuousManager(nn.Module):
     """
     Manager module for continuous domain.
@@ -191,6 +231,10 @@ class ContinuousFeUdalCatNetwork(nn.Module):
         self.register_buffer("obs_var", torch.ones(1, obs_dim, device=device))
         self.register_buffer("obs_count", torch.tensor(1e-4, dtype=torch.float32, device=device))
 
+        # Value / Return running normalizers for Bellman consistency (PopArt-lite)
+        self.val_norm_m = ValueNormalizer(device)
+        self.val_norm_w = ValueNormalizer(device)
+
     def _normalize_obs(self, x: torch.Tensor, update: bool = True) -> torch.Tensor:
         if update and self.training:
             batch_mean = x.mean(dim=0, keepdim=True)
@@ -257,7 +301,7 @@ class ContinuousFeUdalCatNetwork(nn.Module):
         return self.manager.state_goal_cosine(states, goals, masks)
 
 
-def continuous_feudal_cat_loss(storage: Storage, next_v_m: torch.Tensor, next_v_w: torch.Tensor, args) -> tuple[torch.Tensor, dict]:
+def continuous_feudal_cat_loss(storage: Storage, next_v_m: torch.Tensor, next_v_w: torch.Tensor, model, args) -> tuple[torch.Tensor, dict]:
     """
     Computes total continuous FuN loss for FeUdalCat.
     Exact same formulation as continuous FuN.
@@ -277,16 +321,24 @@ def continuous_feudal_cat_loss(storage: Storage, next_v_m: torch.Tensor, next_v_
         ['r_i', 'v_m', 'v_w', 'ret_w', 'ret_m', 'logp', 'entropy', 's_goal_cos']
     )
 
-    # Critic learns true unnormalized returns (preserves value scale across rollout boundaries)
-    advantage_w = ret_w - value_w
-    advantage_m = ret_m - value_m
+    # 1. Update running return statistics with true returns (Bellman consistent)
+    model.val_norm_w.update(ret_w.detach())
+    model.val_norm_m.update(ret_m.detach())
 
-    value_w_loss = 0.5 * advantage_w.pow(2).mean()
-    value_m_loss = 0.5 * advantage_m.pow(2).mean()
+    # 2. Normalize targets to O(1) for Critic regression (PopArt-lite)
+    ret_w_target = model.val_norm_w.normalize(ret_w).detach()
+    ret_m_target = model.val_norm_m.normalize(ret_m).detach()
 
-    # Standardize advantages before policy gradient updates to prevent velocity-induced gradient spikes
-    adv_w_norm = (advantage_w.detach() - advantage_w.detach().mean()) / (advantage_w.detach().std() + 1e-8)
-    adv_m_norm = (advantage_m.detach() - advantage_m.detach().mean()) / (advantage_m.detach().std() + 1e-8)
+    # 3. Critic MSE loss in O(1) space (Loss ~ 0.5, completely stable)
+    value_w_loss = 0.5 * (value_w - ret_w_target).pow(2).mean()
+    value_m_loss = 0.5 * (value_m - ret_m_target).pow(2).mean()
+
+    # 4. Standardize advantages before policy gradient updates
+    advantage_w = ret_w_target - value_w.detach()
+    advantage_m = ret_m_target - value_m.detach()
+
+    adv_w_norm = (advantage_w - advantage_w.mean()) / (advantage_w.std() + 1e-8)
+    adv_m_norm = (advantage_m - advantage_m.mean()) / (advantage_m.std() + 1e-8)
 
     loss_worker = (logps * adv_w_norm).mean()
 
@@ -315,6 +367,10 @@ def continuous_feudal_cat_loss(storage: Storage, next_v_m: torch.Tensor, next_v_
         'policy/worker_intrinsic_reward': rewards_intrinsic.mean().item(),
         'policy/manager_cosines': aligned_cosines.mean().item(),
         'policy/manager_advantage': advantage_m.mean().item(),
+        'stats/return_w_mean': model.val_norm_w.mean.item(),
+        'stats/return_w_std': torch.sqrt(torch.clamp(model.val_norm_w.var, min=1.0)).item(),
+        'stats/return_m_mean': model.val_norm_m.mean.item(),
+        'stats/return_m_std': torch.sqrt(torch.clamp(model.val_norm_m.var, min=1.0)).item(),
     }
 
     return loss, loss_dict

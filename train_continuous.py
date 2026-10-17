@@ -304,12 +304,12 @@ def train(args):
                 step += args.num_workers
 
             with torch.no_grad():
-                *_, next_v_m, next_v_w = model(obs, goals, states, masks[-1], save=False)
-                next_v_m = next_v_m.detach()
-                next_v_w = next_v_w.detach()
+                *_, next_v_m_raw, next_v_w_raw = model(obs, goals, states, masks[-1], save=False)
+                next_v_m = model.val_norm_m.denormalize(next_v_m_raw).detach()
+                next_v_w = model.val_norm_w.denormalize(next_v_w_raw).detach()
 
             optimizer.zero_grad()
-            loss, loss_dict = loss_fn(storage, next_v_m, next_v_w, args)
+            loss, loss_dict = loss_fn(storage, next_v_m, next_v_w, model, args)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
