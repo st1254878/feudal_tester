@@ -69,8 +69,8 @@ def parse_args():
     # Periodic Evaluation
     parser.add_argument("--eval-interval", type=int, default=30000,
                         help="Step interval to run deterministic policy evaluation (default: 30k, 0 to disable)")
-    parser.add_argument("--eval-episodes", type=int, default=10,
-                        help="Number of evaluation episodes per evaluation check (default: 10)")
+    parser.add_argument("--eval-episodes", type=int, default=20,
+                        help="Number of evaluation episodes per evaluation check (default: 20)")
 
     # Model architecture selection
     parser.add_argument("--model-type", type=str, default="fun", choices=["fun", "feudal_cat"],
@@ -117,9 +117,10 @@ def evaluate_policy(eval_model, train_model, env_id: str, num_episodes: int = 5,
             obs, _ = eval_env.reset(seed=seed + ep)
             goals, states, masks = eval_model.init_obj()
             # Reset recurrent memory for clean episode evaluation
+            worker_hidden_dim = eval_model.worker.wrnn.hidden_size
             eval_model.worker_hidden = (
-                torch.zeros(1, eval_model.k * eval_model.act_dim, device=device),
-                torch.zeros(1, eval_model.k * eval_model.act_dim, device=device)
+                torch.zeros(1, worker_hidden_dim, device=device),
+                torch.zeros(1, worker_hidden_dim, device=device)
             )
             eval_model.manager_hidden = eval_model.manager.mrnn.init_hidden(1, device)
 
@@ -321,7 +322,7 @@ def train(args):
             if args.eval_interval > 0 and step >= next_eval_step:
                 eval_mean, eval_std, eval_len = evaluate_policy(
                     eval_model, model, args.env_name, num_episodes=args.eval_episodes,
-                    seed=args.seed + 1000 + (step // max(1, args.eval_interval)), device=device
+                    seed=args.seed + 1000, device=device
                 )
                 logger.log_scalars({
                     "eval/mean_reward": eval_mean,
@@ -331,6 +332,7 @@ def train(args):
                 print(f"\n>>> [EVAL @ Step {step:,}] Deterministic Return: {eval_mean:.2f} +/- {eval_std:.2f} | Length: {eval_len:.1f}")
                 if eval_mean > best_eval_reward:
                     best_eval_reward = eval_mean
+                    os.makedirs(logger.checkpoint_dir, exist_ok=True)
                     best_path = os.path.join(logger.checkpoint_dir, "model_best.pt")
                     torch.save({
                         "step": step,
@@ -351,6 +353,7 @@ def train(args):
                     "optimizer": optimizer.state_dict(),
                     "args": vars(args)
                 }
+                os.makedirs(logger.checkpoint_dir, exist_ok=True)
                 ckpt_path = os.path.join(logger.checkpoint_dir, f"model_step_{step}.pt")
                 latest_path = os.path.join(logger.checkpoint_dir, "model_latest.pt")
                 torch.save(ckpt_dict, ckpt_path)
@@ -368,6 +371,7 @@ def train(args):
             "optimizer": optimizer.state_dict(),
             "args": vars(args)
         }
+        os.makedirs(logger.checkpoint_dir, exist_ok=True)
         final_ckpt = os.path.join(logger.checkpoint_dir, f"model_final_{step}.pt")
         latest_path = os.path.join(logger.checkpoint_dir, "model_latest.pt")
         torch.save(ckpt_dict, final_ckpt)

@@ -74,6 +74,12 @@ def evaluate(args):
     for ep in range(args.episodes):
         obs, info = env.reset(seed=ep)
         goals, states, masks = model.init_obj()
+        worker_hidden_dim = model.worker.wrnn.hidden_size
+        model.worker_hidden = (
+            torch.zeros(1, worker_hidden_dim, device=device),
+            torch.zeros(1, worker_hidden_dim, device=device)
+        )
+        model.manager_hidden = model.manager.mrnn.init_hidden(1, device)
         obs_batch = np.expand_dims(obs, axis=0)
 
         total_reward = 0.0
