@@ -67,13 +67,19 @@ class ValueNormalizer(nn.Module):
             self.var.copy_(new_var)
             self.count.copy_(tot_count)
 
-    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+    def normalize(self, x: torch.Tensor, center: bool = True) -> torch.Tensor:
         std = torch.sqrt(torch.clamp(self.var, min=1.0))
-        return (x - self.mean) / std
+        if center:
+            return (x - self.mean) / std
+        return x / std
 
-    def denormalize(self, x: torch.Tensor) -> torch.Tensor:
+    def denormalize(self, x: torch.Tensor, center: bool = True) -> torch.Tensor:
+        # Must mirror the `center` used in normalize() for the critic targets,
+        # otherwise every bootstrap injects a phantom +mean into the returns.
         std = torch.sqrt(torch.clamp(self.var, min=1.0))
-        return x * std + self.mean
+        if center:
+            return x * std + self.mean
+        return x * std
 
 
 class ContinuousManager(nn.Module):
@@ -153,7 +159,7 @@ class ContinuousWorker(nn.Module):
         raw_mu = torch.einsum("bk, bka -> ba", w, u_matrix)
         mu = torch.tanh(raw_mu)  # Continuous actions bounded in [-1, 1]
 
-        std = torch.exp(torch.clamp(self.log_std, -2.0, 1.0)).expand_as(mu)
+        std = torch.exp(torch.clamp(self.log_std, -2.0, 0.2)).expand_as(mu)
         dist = Normal(mu, std)
 
         value_est = self.critic(u)
@@ -187,14 +193,17 @@ class ContinuousFeUdalNetwork(nn.Module):
         hidden_dim_worker: int = 16,
         time_horizon: int = 10,
         dilation: int = 10,
-        eps: float = 1e-4,
-        device: torch.device = torch.device("cpu")
+        eps: float = 0.15,
+        device: torch.device = torch.device("cpu"),
+        spatial_obs_norm: str = "fixed"
     ):
         super().__init__()
         self.num_workers = num_workers
         self.c = time_horizon
         self.d = hidden_dim_manager
         self.k = hidden_dim_worker
+        # AntMaze position/goal inputs: "fixed" (x * 0.2) or "running" (running mean/var like other dims, used by older checkpoints)
+        self.spatial_obs_norm = spatial_obs_norm
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.device = device
@@ -219,6 +228,32 @@ class ContinuousFeUdalNetwork(nn.Module):
         self.val_norm_w = ValueNormalizer(device)
 
     def _normalize_obs(self, x: torch.Tensor, update: bool = True) -> torch.Tensor:
+        if self.obs_dim == 31 and self.spatial_obs_norm == "fixed":
+            # AntMaze spatial coordinate protection:
+            # Retain absolute geometric relationships in [-1.0, 1.0] scale without running mean subtraction
+            pos_and_goal = x[:, :4] * 0.2
+            proprio = x[:, 4:]
+            if update and self.training:
+                p_mean = proprio.mean(dim=0, keepdim=True)
+                p_var = proprio.var(dim=0, unbiased=False, keepdim=True)
+                b_count = float(x.shape[0])
+
+                delta = p_mean - self.obs_mean[:, 4:]
+                tot_count = self.obs_count + b_count
+                new_mean = self.obs_mean[:, 4:] + delta * b_count / tot_count
+                m_a = self.obs_var[:, 4:] * self.obs_count
+                m_b = p_var * b_count
+                m2 = m_a + m_b + delta.pow(2) * self.obs_count * b_count / tot_count
+                new_var = m2 / tot_count
+
+                self.obs_mean[:, 4:].copy_(new_mean)
+                self.obs_var[:, 4:].copy_(new_var)
+                self.obs_count.copy_(tot_count)
+
+            proprio_norm = (proprio - self.obs_mean[:, 4:]) / torch.sqrt(self.obs_var[:, 4:] + 1e-8)
+            proprio_norm = torch.clamp(proprio_norm, -10.0, 10.0)
+            return torch.cat([pos_and_goal, proprio_norm], dim=-1)
+
         if update and self.training:
             batch_mean = x.mean(dim=0, keepdim=True)
             batch_var = x.var(dim=0, unbiased=False, keepdim=True)
@@ -251,7 +286,26 @@ class ContinuousFeUdalNetwork(nn.Module):
         self.worker_hidden = (self.worker_hidden[0].detach(), self.worker_hidden[1].detach())
         self.manager_hidden = (self.manager_hidden[0].detach(), self.manager_hidden[1].detach())
 
-    def forward(self, x: torch.Tensor, goals: list[torch.Tensor], states: list[torch.Tensor], mask: torch.Tensor, save: bool = True):
+    def reset_workers(self, reset_mask: torch.Tensor, goals: list[torch.Tensor], states: list[torch.Tensor]):
+        """
+        Isolates episodes across parallel workers: when a worker terminates (reset_mask == 0),
+        clears its historical goals and states to prevent cross-episode contamination.
+        """
+        for i in range(len(goals)):
+            goals[i] = goals[i] * reset_mask
+        for i in range(len(states)):
+            states[i] = states[i] * reset_mask
+        self.worker_hidden = (
+            self.worker_hidden[0] * reset_mask,
+            self.worker_hidden[1] * reset_mask
+        )
+        mask_exp = reset_mask.unsqueeze(1)
+        self.manager_hidden = (
+            self.manager_hidden[0] * mask_exp,
+            self.manager_hidden[1] * mask_exp
+        )
+
+    def forward(self, x: torch.Tensor, goals: list[torch.Tensor], states: list[torch.Tensor], mask: torch.Tensor, save: bool = True, ablate_goal: str = "none"):
         if not isinstance(x, torch.Tensor):
             x = torch.as_tensor(x, dtype=torch.float32, device=self.device)
         else:
@@ -260,6 +314,11 @@ class ContinuousFeUdalNetwork(nn.Module):
         x = self._normalize_obs(x, update=save)
         z = self.percept(x)
         goal, manager_hidden, state, value_m = self.manager(z, self.manager_hidden, mask, save=save)
+
+        if ablate_goal == "zero":
+            goal = torch.zeros_like(goal)
+        elif ablate_goal == "random":
+            goal = F.normalize(torch.randn_like(goal), dim=-1)
 
         if save:
             self.manager_hidden = manager_hidden
@@ -283,57 +342,73 @@ class ContinuousFeUdalNetwork(nn.Module):
     def state_goal_cosine(self, states, goals, masks):
         return self.manager.state_goal_cosine(states, goals, masks)
 
-
 def continuous_feudal_loss(storage: Storage, next_v_m: torch.Tensor, next_v_w: torch.Tensor, model, args) -> tuple[torch.Tensor, dict]:
     ret_m = next_v_m
     ret_w = next_v_w
 
+    # Time-limit truncation bootstraps (gamma * V(final_obs), already in true scale), 0 elsewhere
+    has_boot = 'boot_m' in storage.keys
+
     storage.placeholder(['ret_m', 'ret_w'])
     for i in reversed(range(args.num_steps)):
-        ret_m = storage.r[i] + args.gamma_m * ret_m * storage.m[i]
-        r_i_step = storage.r_i[i + 1] if i + 1 < args.num_steps else storage.r_i[i]
-        ret_w = (storage.r[i] + args.alpha * r_i_step) + args.gamma_w * ret_w * storage.m[i]
+        boot_m = storage.boot_m[i] if has_boot else 0.0
+        boot_w = storage.boot_w[i] if has_boot else 0.0
+
+        ret_m = storage.r[i] + boot_m + args.gamma_m * ret_m * storage.m[i]
         storage.ret_m[i] = ret_m
+
+        r_i_step = storage.r_i[i + 1] if i + 1 < args.num_steps else storage.r_i[i]
+        ret_w = (storage.r[i] + args.alpha * r_i_step) + boot_w + args.gamma_w * ret_w * storage.m[i]
         storage.ret_w[i] = ret_w
 
-    rewards_intrinsic, value_m, value_w, ret_w, ret_m, logps, entropy, state_goal_cosines = storage.stack(
-        ['r_i', 'v_m', 'v_w', 'ret_w', 'ret_m', 'logp', 'entropy', 's_goal_cos']
-    )
+    stacked = storage.stack(['r_i', 'v_m', 'v_w', 'ret_w', 'ret_m', 'logp', 'entropy', 's_goal_cos'])
+    rewards_intrinsic, value_m, value_w, ret_w, ret_m, logps, entropy, state_goal_cosines = stacked
 
-    # 1. Update running return statistics with true returns (Bellman consistent)
+    undiluted = getattr(args, "undiluted_reward", True)
+
+    # 1. Update running return statistics with true returns from all workers (Bellman consistent)
     model.val_norm_w.update(ret_w.detach())
     model.val_norm_m.update(ret_m.detach())
 
-    # 2. Normalize targets to O(1) for Critic regression (PopArt-lite)
-    ret_w_target = model.val_norm_w.normalize(ret_w).detach()
-    ret_m_target = model.val_norm_m.normalize(ret_m).detach()
+    # 2. Normalize targets for Critic regression (PopArt-lite)
+    # When undiluted is True, do not subtract mean so 0-return parallel workers stay at target 0.0
+    ret_w_target = model.val_norm_w.normalize(ret_w, center=(not undiluted)).detach()
+    ret_m_target = model.val_norm_m.normalize(ret_m, center=(not undiluted)).detach()
 
-    # 3. Critic MSE loss in O(1) space (Loss ~ 0.5, completely stable)
+    # 3. Critic MSE losses strictly normalized with .mean() (prevents Critic explosion & gradient imbalance)
     value_w_loss = 0.5 * (value_w - ret_w_target).pow(2).mean()
     value_m_loss = 0.5 * (value_m - ret_m_target).pow(2).mean()
 
-    # 4. Standardize advantages before policy gradient updates
+    # 4. Standardize advantages separately before policy gradient updates
     advantage_w = ret_w_target - value_w.detach()
     advantage_m = ret_m_target - value_m.detach()
 
-    adv_w_norm = (advantage_w - advantage_w.mean()) / (advantage_w.std() + 1e-8)
-    adv_m_norm = (advantage_m - advantage_m.mean()) / (advantage_m.std() + 1e-8)
+    if undiluted:
+        # Amplify reward advantage signal by num_workers to offset batch mean division,
+        # preserving full policy gradient scale while keeping loss strictly normalized in O(1).
+        adv_w_norm = advantage_w * float(getattr(args, "num_workers", getattr(model, "num_workers", 1)))
+        adv_m_norm = advantage_m * float(getattr(args, "num_workers", getattr(model, "num_workers", 1)))
+    else:
+        adv_w_norm = (advantage_w - advantage_w.mean()) / (advantage_w.std() + 1e-8)
+        adv_m_norm = (advantage_m - advantage_m.mean()) / (advantage_m.std() + 1e-8)
 
     loss_worker = (logps * adv_w_norm).mean()
 
     c = args.time_horizon
     if args.num_steps > c:
         aligned_cosines = state_goal_cosines[c:]
-        aligned_adv_m = adv_m_norm[:-c]
+        aligned_adv_m = adv_m_norm[:len(aligned_cosines)]
     else:
         aligned_cosines = state_goal_cosines
         aligned_adv_m = adv_m_norm
 
     loss_manager = (aligned_cosines * aligned_adv_m).mean()
-
     mean_entropy = entropy.mean()
 
-    loss = -loss_worker - loss_manager + value_w_loss + value_m_loss - args.entropy_coef * mean_entropy
+    if getattr(args, "freeze_worker", False):
+        loss = -loss_manager + value_m_loss
+    else:
+        loss = -loss_worker - loss_manager + value_w_loss + value_m_loss - args.entropy_coef * mean_entropy
 
     loss_dict = {
         'loss/total': loss.item(),
@@ -342,10 +417,12 @@ def continuous_feudal_loss(storage: Storage, next_v_m: torch.Tensor, next_v_w: t
         'loss/value_worker': value_w_loss.item(),
         'loss/value_manager': value_m_loss.item(),
         'policy/entropy': mean_entropy.item(),
-        'policy/worker_advantage': advantage_w.mean().item(),
+        'policy/worker_advantage_mean': advantage_w.mean().item(),
+        'policy/worker_advantage_std': advantage_w.std().item(),
         'policy/worker_intrinsic_reward': rewards_intrinsic.mean().item(),
         'policy/manager_cosines': aligned_cosines.mean().item(),
-        'policy/manager_advantage': advantage_m.mean().item(),
+        'policy/manager_advantage_mean': advantage_m.mean().item(),
+        'policy/manager_advantage_std': advantage_m.std().item(),
         'stats/return_w_mean': model.val_norm_w.mean.item(),
         'stats/return_w_std': torch.sqrt(torch.clamp(model.val_norm_w.var, min=1.0)).item(),
         'stats/return_m_mean': model.val_norm_m.mean.item(),

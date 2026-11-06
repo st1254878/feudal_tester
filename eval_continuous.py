@@ -14,8 +14,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Continuous FeUdal Network on MuJoCo")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to trained model checkpoint .pt file")
-    parser.add_argument("--model-type", type=str, default="fun", choices=["fun", "feudal_cat"],
-                        help="Model architecture: standard FuN ('fun') or direct goal concatenation ('feudal_cat')")
+    parser.add_argument("--model-type", type=str, default="fun", choices=["fun", "feudal_cat", "worker_only"],
+                        help="Model architecture: standard FuN ('fun'), direct goal concatenation ('feudal_cat'), or Worker-Only ('worker_only')")
     parser.add_argument("--env-name", type=str, default="HalfCheetah-v4",
                         help="Gymnasium MuJoCo environment ID (HalfCheetah-v4, Ant-v4, etc.)")
     parser.add_argument("--episodes", type=int, default=1,
@@ -44,12 +44,25 @@ def evaluate(args):
     print(f"Running continuous evaluation on device: {device}")
 
     render_mode = "human" if args.human else ("rgb_array" if args.record_gif else None)
+    try:
+        import gymnasium_robotics
+    except ImportError:
+        pass
     env = gym.make(args.env_name, render_mode=render_mode)
+    if isinstance(env.observation_space, gym.spaces.Dict):
+        from gymnasium.wrappers import FlattenObservation
+        env = FlattenObservation(env)
 
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
 
-    model_cls = ContinuousFeUdalCatNetwork if args.model_type == "feudal_cat" else ContinuousFeUdalNetwork
+    if args.model_type == "feudal_cat":
+        model_cls = ContinuousFeUdalCatNetwork
+    elif args.model_type == "worker_only":
+        from worker_only_continuous import ContinuousWorkerOnlyNetwork
+        model_cls = ContinuousWorkerOnlyNetwork
+    else:
+        model_cls = ContinuousFeUdalNetwork
     model = model_cls(
         num_workers=1,
         obs_dim=obs_dim,
